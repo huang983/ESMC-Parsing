@@ -94,8 +94,8 @@ int main(int argc, char *argv[])
 
 	memset(&if_ip, 0, sizeof(struct ifreq));
 
-	/* Open PF_PACKET socket, listening for ETH_P_ALL ETHER_TYPE */
-	if ((sockfd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_ALL))) == -1) {
+	/* Open PF_PACKET socket, listening for the Slow Protocol */
+	if ((sockfd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_SLOW))) == -1) {
 		perror("listener: socket");	
 		return -1;
 	}
