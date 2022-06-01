@@ -1,102 +1,185 @@
-/*
- *  This program is free software: you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation, either version 3 of the License, or
- *  (at your option) any later version.
- */
-
-#include <arpa/inet.h>
-#include <linux/if_packet.h>
-#include <linux/ip.h>
-#include <linux/udp.h>
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <net/if.h>
-#include <netinet/ether.h>
-#include<signal.h>
-
-#define DEST_MAC0	0x01
-#define DEST_MAC1	0x80
-#define DEST_MAC2	0xC2
-#define DEST_MAC3	0x00
-#define DEST_MAC4	0x00
-#define DEST_MAC5	0x02
-
-#define ETHER_TYPE	0x0800
-
-#define DEFAULT_IF	"eth0"
-#define BUF_SIZ		1024
-
-/* SSM codes */
-#define QL_EEC1	   	0xFF
-#define QL_EEC2	   	0xFF
-#define QL_PRTC	   	0x20
-#define QL_ePRTC	0x21
-#define QL_eEEC		0x22
+#include "esmc.h"
 
 static int stop;
-
-struct esmc_msg {
-	uint8_t dst_addr[6];
-	uint8_t src_addr[6];
-	uint8_t ethertype[2];
-	uint8_t subtype;
-	uint8_t itu_oui[3];
-	uint8_t itu_subtype[2];
-	uint8_t _reserved: 3,
-			event:	   1,
-			version:   4;
-	uint8_t reserved[3];
-	uint8_t data_padding[39];
-};
-
-struct ql_tlv {
-	uint8_t type;
-	uint8_t len[2];
-	uint8_t ssm_code: 4, 
-			unused:   4;
-};
+static int debug;
+static int show_packet;
+static int option;
+char ifName[IFNAMSIZ];
 
 void sig_handler(int signum)
 {
 	stop = 1;
 }
 
-int main(int argc, char *argv[])
+static int parse_config(char *filename)
 {
-	char sender[INET6_ADDRSTRLEN];
-	int sockfd, ret, i;
+#define SYNCE_CONF_LINE_SZ 128
+	FILE *fp = NULL;
+	char buf[SYNCE_CONF_LINE_SZ];
+	char *key = NULL;
+	char *val = NULL;
+
+	if ((fp = fopen(filename, "r")) == NULL) {
+		char err_msg[128];
+		sprintf(err_msg, "Failed to open %s", ifName);
+		SYNCE_ERR((const char *)err_msg);
+		return -1;
+	}
+
+	/* Start parsing */
+	while (!feof(fp)) {
+		if (fgets(buf, SYNCE_CONF_LINE_SZ, fp) == NULL) {
+			continue;
+		}
+
+		if ((buf[0] == '#') || (buf[0] == '\n' ||
+             buf[0] == ' ') || ((key = strtok(buf, "=")) == NULL)) {
+            continue;
+        }
+
+		/* Split the string by '=' delimeter */
+        val = strtok(NULL, "=");
+		if (val == NULL) {
+			SYNCE_ERR("Invalid value");
+			return -1;
+		}
+
+		/* Replace trailing newline char w/ end of line  */
+        val[strcspn(val, "\n")] = '\0';
+
+		if (strncmp(key, "interface", strlen("interface")) == 0) {
+			if (strlen(ifName) > 0) {
+				/* Already set from command-line args */
+				continue;
+			}
+			strncpy(ifName, val, IFNAMSIZ - 1);
+			ifName[IFNAMSIZ - 1] = '\0';
+		} else if (strncmp(key, "debug", strlen("debug")) == 0) {
+			if (debug) {
+				/* Already set from command-line args */
+				continue;
+			}
+			debug = (val[0] == 'y') ? 1 : 0;
+		} else if (strncmp(key, "show_packet", strlen("show_packet")) == 0) {
+			show_packet = (val[0] == 'y') ? 1 : 0;
+		} else if (strncmp(key, "option", strlen("option")) == 0) {
+			option = atoi(val);
+		}
+	}
+
+	fclose(fp);
+
+	return 0;
+}
+
+static int parse(int argc, char **argv)
+{
+	const char *opstr = "di:f:o:";
+	int ch;
+
+	memset(ifName, 0, sizeof(ifName));
+
+	while ((ch = getopt(argc, argv, opstr)) != -1) {
+		switch(ch) {
+			case 'f':
+				parse_config(optarg);
+				break;
+			case 'i':
+				strncpy(ifName, optarg, IFNAMSIZ - 1);
+				ifName[IFNAMSIZ - 1] = '\0';
+				break;
+			case 'd':
+				debug = 1;
+				break;
+			case 'o':
+				option = atoi(optarg);
+				break;
+			default:
+				break;
+		}
+	}
+
+	if (strlen(ifName) == 0) {
+		strncpy(ifName, DEFAULT_IF, IFNAMSIZ - 1);
+		ifName[IFNAMSIZ - 1] = '\0';
+	}
+
+	return 0;
+}
+
+static inline const char *ssm_code_op1_to_str(uint8_t ssm_code)
+{
+	/* Clear the 4 MSB */
+	ssm_code &= 0x0F;
+
+	switch (ssm_code) {
+		case OP1_QL_PRC:
+			return "PRC/PRTC/ePRTC";
+		case OP1_QL_SSU_A:
+			return "SSU_A";
+		case OP1_QL_SSU_B:
+			return "SSU_B";
+		case OP1_QL_EEC1:
+			return "EEC1/eEEC";
+		case OP1_QL_DNU:
+			return "DNU";
+		default:
+			return "";
+	}
+
+	return "";
+}
+
+static inline const char *ssm_code_op2_to_str(uint8_t ssm_code)
+{
+	/* Clear the 4 MSB */
+	ssm_code &= 0x0F;
+
+	switch (ssm_code) {
+		case OP2_QL_STU:
+			return "STU";
+		case OP2_QL_PRS:
+			return "PRS/PRTC/ePRTC";
+		case OP2_QL_ST2:
+			return "ST2";
+		case OP2_QL_TNC:
+			return "TNC";
+		case OP2_QL_EEC2:
+			return "EEC2/eEEC";
+		case OP2_QL_ST3E:
+			return "ST3E";
+		case OP2_QL_PROV:
+			return "PROV";
+		case OP2_QL_DUS:
+			return "DUS";
+		default:
+			return "";
+	}
+
+	return "";
+}
+
+int main(int argc, char **argv)
+{
+	int sockfd, i;
 	int sockopt;
 	ssize_t numbytes;
 	struct ifreq ifopts;	/* set promiscuous mode */
-	struct ifreq if_ip;	/* get ip addr */
-	struct sockaddr_storage their_addr;
 	uint8_t buf[BUF_SIZ];
-	char ifName[IFNAMSIZ];
-	
-	/* Get interface name */
-	if (argc > 1)
-		strcpy(ifName, argv[1]);
-	else
-		strcpy(ifName, DEFAULT_IF);
+
+	/* Parse input args */
+	parse(argc, argv);
 
 	/* Header structures */
 	struct ether_header *eh = (struct ether_header *) buf;
-	struct iphdr *iph = (struct iphdr *) (buf + sizeof(struct ether_header));
-	struct udphdr *udph = (struct udphdr *) (buf + sizeof(struct iphdr) + sizeof(struct ether_header));
 
 	/* Packet structure */
 	struct esmc_msg *esmc = (struct esmc_msg *)buf;
-	struct ql_tlv *ql_tlv = (struct ql_tlv *)esmc->data_padding;
-
-	memset(&if_ip, 0, sizeof(struct ifreq));
+	struct ql_tlv *ql_tlv = (struct ql_tlv *)&esmc->ql_tlv;
 
 	/* Open PF_PACKET socket, listening for the Slow Protocol */
 	if ((sockfd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_SLOW))) == -1) {
-		perror("listener: socket");	
+		SYNCE_ERR("listener: socket");	
 		return -1;
 	}
 
@@ -107,13 +190,15 @@ int main(int argc, char *argv[])
 	ioctl(sockfd, SIOCSIFFLAGS, &ifopts);
 	/* Allow the socket to be reused - incase connection is closed prematurely */
 	if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &sockopt, sizeof sockopt) == -1) {
-		perror("setsockopt");
+		SYNCE_ERR("setsockopt");
 		close(sockfd);
 		exit(EXIT_FAILURE);
 	}
 	/* Bind to device */
 	if (setsockopt(sockfd, SOL_SOCKET, SO_BINDTODEVICE, ifName, IFNAMSIZ-1) == -1)	{
-		perror("SO_BINDTODEVICE");
+		char err_msg[128];
+		sprintf(err_msg, "SO_BINDTODEVICE %s", ifName);
+		SYNCE_ERR((const char *)err_msg);
 		close(sockfd);
 		exit(EXIT_FAILURE);
 	}
@@ -122,16 +207,15 @@ int main(int argc, char *argv[])
 	signal(SIGINT, sig_handler);
 
 	while (!stop) {
-		// printf("listener: Waiting to recvfrom...\n");
 		numbytes = recvfrom(sockfd, buf, BUF_SIZ, 0, NULL, NULL);
-		// printf("listener: got packet %lu bytes\n", numbytes);
-		// printf("Destination MAC: %x:%x:%x:%x:%x:%x\n",
-		// 					eh->ether_dhost[0],
-		// 					eh->ether_dhost[1],
-		// 					eh->ether_dhost[2],
-		// 					eh->ether_dhost[3],
-		// 					eh->ether_dhost[4],
-		// 					eh->ether_dhost[5]);
+			SYNCE_DBG("listener: got packet %lu bytes\n", numbytes);
+			SYNCE_DBG("Destination MAC: %x:%x:%x:%x:%x:%x\n",
+								eh->ether_dhost[0],
+								eh->ether_dhost[1],
+								eh->ether_dhost[2],
+								eh->ether_dhost[3],
+								eh->ether_dhost[4],
+								eh->ether_dhost[5]);
 		/* Check the packet is for me */
 		if (eh->ether_dhost[0] == DEST_MAC0 &&
 				eh->ether_dhost[1] == DEST_MAC1 &&
@@ -139,7 +223,7 @@ int main(int argc, char *argv[])
 				eh->ether_dhost[3] == DEST_MAC3 &&
 				eh->ether_dhost[4] == DEST_MAC4 &&
 				eh->ether_dhost[5] == DEST_MAC5) {
-			printf("Correct destination MAC: %x:%x:%x:%x:%x:%x\n",
+			SYNCE_DBG("Correct destination MAC: %x:%x:%x:%x:%x:%x\n",
 							eh->ether_dhost[0],
 							eh->ether_dhost[1],
 							eh->ether_dhost[2],
@@ -149,37 +233,22 @@ int main(int argc, char *argv[])
 		} else {
 			continue;
 		}
-		/* Get source IP */
-		((struct sockaddr_in *)&their_addr)->sin_addr.s_addr = iph->saddr;
-		inet_ntop(AF_INET, &((struct sockaddr_in*)&their_addr)->sin_addr, sender, sizeof sender);
 
-		/* Look up my device IP addr if possible */
-		strncpy(if_ip.ifr_name, ifName, IFNAMSIZ-1);
-		if (ioctl(sockfd, SIOCGIFADDR, &if_ip) >= 0) { /* if we can't check then don't */
-			printf("Source IP: %s\n My IP: %s\n", sender, 
-					inet_ntoa(((struct sockaddr_in *)&if_ip.ifr_addr)->sin_addr));
-			/* ignore if I sent it */
-			if (strcmp(sender, inet_ntoa(((struct sockaddr_in *)&if_ip.ifr_addr)->sin_addr)) == 0)	{
-				printf("but I sent it :(\n");
-				ret = -1;
-				goto done;
-			}
+		if (show_packet || debug) {
+			/* Print packet */
+			SYNCE_INFO("\tData (%ldbytes):", numbytes);
+			for (i=0; i<numbytes; i++) printf("%02x:", buf[i]);
+			SYNCE_INFO("\n");
+			SYNCE_INFO("ESMC - version: 0%X, event: 0x%X\n", esmc->version, esmc->event);
+			SYNCE_INFO("QL TLV type: 0x%02X\n", ql_tlv->type);
+			SYNCE_INFO("QL TLV length: 0x%02X 0x%02X\n", ql_tlv->len[0], ql_tlv->len[1]);
+			SYNCE_INFO("SSM code: %s\n", (option == 1) ? ssm_code_op1_to_str(ql_tlv->ssm_code) :
+														 ssm_code_op2_to_str(ql_tlv->ssm_code));
 		}
-
-		/* UDP payload length */
-		ret = ntohs(udph->len) - sizeof(struct udphdr);
-
-		/* Print packet */
-		// printf("\tData (%ldbytes):", numbytes);
-		// for (i=0; i<numbytes; i++) printf("%02x:", buf[i]);
-		// printf("\n");
-		printf("ESMC - version: 0%X, event: 0x%X\n", esmc->version, esmc->event);
-		printf("QL TLV type: 0x%02X\n", ql_tlv->type);
-		printf("QL TLV length: 0x%02X 0x%02X\n", ql_tlv->len[0], ql_tlv->len[1]);
-		printf("SSM code: 0x%X\n", ql_tlv->ssm_code);
 	}
 
-done:
+	/* Exit flow */
 	close(sockfd);
-	return ret;
+	
+	return 0;
 }
